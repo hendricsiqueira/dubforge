@@ -15,7 +15,7 @@ from .catalog import (
     SOURCE_LANGUAGE_CHOICES,
     WHISPER_MODELS,
 )
-from .pipeline import DubPipeline, status_markdown
+from .pipeline import DubPipeline, metrics_markdown, status_markdown
 from .store import BatchStore, ProjectStore
 
 
@@ -58,7 +58,8 @@ def _source_paths(value: str | list[str] | None) -> list[str]:
 def _settings(
     source_language: str, whisper_model: str, target_languages: list[str], voice_mode: str,
     voice_file: str | None, sync_mode: str, bitrate: str, generate_srt: bool,
-    preserve_background: bool,
+    preserve_background: bool, gpu_hourly_usd: float, usd_brl: float,
+    competitor_brl_per_minute: float,
 ) -> dict[str, Any]:
     return {
         "source_language": source_language,
@@ -70,6 +71,9 @@ def _settings(
         "bitrate": bitrate,
         "generate_srt": generate_srt,
         "preserve_background": preserve_background,
+        "gpu_hourly_usd": float(gpu_hourly_usd or 0.0),
+        "usd_brl": float(usd_brl or 0.0),
+        "competitor_brl_per_minute": float(competitor_brl_per_minute or 2.0),
         "llm_backend": "Qwen2.5-7B-Instruct",
         "tts_backend": "VoxCPM 2",
     }
@@ -80,7 +84,7 @@ def load_project(project_id: str):
         return (
             "", None, "Portuguese", "large-v3", DEFAULT_TARGETS,
             "Clonar voz original", None, "Priorizar sincronismo", "320k",
-            True, True, status_markdown(None), [],
+            True, True, 0.0, 5.50, 2.0, status_markdown(None), [],
         )
     project = STORE.get(project_id)
     settings = project["settings"]
@@ -90,6 +94,8 @@ def load_project(project_id: str):
         settings["target_languages"], settings["voice_mode"], settings.get("voice_file"),
         "Nunca cortar a fala" if settings["never_cut"] else "Priorizar sincronismo",
         settings["bitrate"], settings["generate_srt"], settings["preserve_background"],
+        settings.get("gpu_hourly_usd", 0.0), settings.get("usd_brl", 5.50),
+        settings.get("competitor_brl_per_minute", 2.0),
         status_markdown(project), output_files,
     )
 
@@ -115,6 +121,9 @@ def run_project(
     bitrate: str,
     generate_srt: bool,
     preserve_background: bool,
+    gpu_hourly_usd: float,
+    usd_brl: float,
+    competitor_brl_per_minute: float,
 ) -> Iterator[tuple[str, list[str], Any, str]]:
     if not target_languages:
         raise gr.Error("Selecione pelo menos um idioma de destino.")
@@ -128,7 +137,8 @@ def run_project(
 
     settings = _settings(
         source_language, whisper_model, target_languages, voice_mode, voice_file,
-        sync_mode, bitrate, generate_srt, preserve_background,
+        sync_mode, bitrate, generate_srt, preserve_background, gpu_hourly_usd,
+        usd_brl, competitor_brl_per_minute,
     )
     if selected_project == "__new__":
         if len(source_paths) > 1:
@@ -198,7 +208,12 @@ def batch_status_markdown(batch: dict[str, Any], project: dict[str, Any] | None,
     if batch.get("current_project_id") in batch["project_ids"]:
         current_index = batch["project_ids"].index(batch["current_project_id"]) + 1
     header = f"## Lote: {batch['name']}\n**Status:** {batch['status']} · **Arquivo atual:** {current_index}/{total}"
-    return f"{header}\n\n{status_markdown(project, message)}" if project else header
+    projects = [
+        STORE.get(project_id) for project_id in batch["project_ids"]
+        if (STORE.project_dir(project_id) / "project.json").exists()
+    ]
+    current = f"{header}\n\n{status_markdown(project, message)}" if project else header
+    return f"{current}\n\n{metrics_markdown(projects, 'Totais do lote')}" if projects else current
 
 
 def run_batch(batch_id: str, update_batch_selector: bool = True) -> Iterator[tuple[str, list[str], Any, str]]:
@@ -316,6 +331,11 @@ def build_ui() -> gr.Blocks:
                     bitrate = gr.Dropdown(MP3_BITRATES, value="320k", label="Bitrate MP3")
                     generate_srt = gr.Checkbox(value=True, label="Gerar SRT natural")
                     preserve_background = gr.Checkbox(value=True, label="Preservar música/ambiente")
+                gr.Markdown("#### Custos estimados")
+                with gr.Row():
+                    gpu_hourly_usd = gr.Number(value=0.0, label="Custo total Vast (US$/hora)", minimum=0)
+                    usd_brl = gr.Number(value=5.50, label="Cotação US$ → R$", minimum=0)
+                    competitor_brl_per_minute = gr.Number(value=2.0, label="Panda (R$/min por idioma)", minimum=0)
                 run_btn = gr.Button("🚀 Dublar / retomar", variant="primary", elem_classes="df-run")
                 with gr.Row():
                     batch_select = gr.Dropdown(batch_choices(), value="", label="Lote salvo")
@@ -334,7 +354,8 @@ def build_ui() -> gr.Blocks:
         load_outputs = [
             project_name, source_file, source_language, whisper_model, target_languages,
             voice_mode, voice_file, sync_mode, bitrate, generate_srt,
-            preserve_background, status, outputs,
+            preserve_background, gpu_hourly_usd, usd_brl, competitor_brl_per_minute,
+            status, outputs,
         ]
         project_select.change(load_project, [project_select], load_outputs)
         refresh_btn.click(refresh_projects, outputs=[project_select])
@@ -343,7 +364,8 @@ def build_ui() -> gr.Blocks:
             run_project,
             [project_select, project_name, source_file, source_language, whisper_model,
              target_languages, voice_mode, voice_file, sync_mode, bitrate,
-             generate_srt, preserve_background],
+             generate_srt, preserve_background, gpu_hourly_usd, usd_brl,
+             competitor_brl_per_minute],
             [status, outputs, project_select, live_status],
         )
         resume_batch_btn.click(
