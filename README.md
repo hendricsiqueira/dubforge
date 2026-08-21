@@ -15,6 +15,20 @@ cache e resultados em uma pasta separada.
 - exporta apenas MP3 e SRT, sem renderizar vídeo;
 - retoma projetos sem repetir etapas concluídas;
 - guarda cache de áudio por idioma, evitando mistura entre idiomas.
+- aceita vários áudios ou vídeos em uma única fila;
+- termina todos os idiomas de um arquivo antes de iniciar o próximo;
+- salva a fila para ser retomada após erro, reinício ou desligamento da instância.
+
+## Processamento em lote
+
+No campo **Vídeo ou áudios originais**, selecione todos os arquivos desejados.
+Defina os idiomas uma única vez e clique em **Dublar / retomar**. O DubForge cria
+um projeto independente para cada arquivo e uma fila persistente em
+`projects/batches/`.
+
+Ele processa a fila em ordem: arquivo 1 em todos os idiomas, depois arquivo 2,
+e assim por diante. Para continuar uma fila interrompida, selecione-a em
+**Lote salvo** e clique em **Retomar lote selecionado**.
 
 ## Estrutura esperada no Windows
 
