@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from dubforge.pipeline import DubPipeline
+from dubforge.pipeline import DubPipeline, metrics_markdown
 from dubforge.store import ProjectStore
 
 
@@ -79,6 +79,9 @@ class ResumeTests(unittest.TestCase):
                 "preserve_background": False,
                 "llm_backend": "Qwen2.5-7B-Instruct",
                 "tts_backend": "VoxCPM 2",
+                "gpu_hourly_usd": 0.50,
+                "usd_brl": 5.50,
+                "competitor_brl_per_minute": 2.0,
             }
             project = store.create("Teste", source, settings)
             pipeline = DubPipeline(store, root / "unused-zast")
@@ -93,6 +96,14 @@ class ResumeTests(unittest.TestCase):
             self.assertEqual(first, second)
             self.assertTrue(any(path.endswith(".mp3") for path in second))
             self.assertTrue(any(path.endswith(".srt") for path in second))
+            loaded = store.get(project["id"])
+            operations = loaded["metrics"]["operations"]
+            self.assertIn("translation:en", operations)
+            self.assertIn("dubbing:en", operations)
+            self.assertIn("project_total", operations)
+            report = metrics_markdown([loaded])
+            self.assertIn("Custo estimado da Vast", report)
+            self.assertIn("Custo estimado no Panda", report)
 
 
 if __name__ == "__main__":
