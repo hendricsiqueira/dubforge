@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from dubforge.store import ProjectStore, slugify
+from dubforge.store import BatchStore, ProjectStore, slugify
 
 
 class StoreTests(unittest.TestCase):
@@ -34,6 +34,22 @@ class StoreTests(unittest.TestCase):
             project["stages"]["transcription"] = "completed"
             store.save(project)
             json.loads((store.project_dir(project["id"]) / "project.json").read_text(encoding="utf-8"))
+
+    def test_batch_persists_project_queue(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ProjectStore(root / "projects")
+            source = root / "audio.wav"
+            source.write_bytes(b"demo")
+            first = store.create("Primeiro", source, {})
+            second = store.create("Segundo", source, {})
+            batches = BatchStore(root / "projects" / "batches")
+
+            batch = batches.create("Série Agosto", [first["id"], second["id"]])
+            loaded = batches.get(batch["id"])
+
+            self.assertEqual(loaded["project_ids"], [first["id"], second["id"]])
+            self.assertEqual(loaded["status"], "pending")
 
 
 if __name__ == "__main__":

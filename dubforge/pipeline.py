@@ -8,7 +8,7 @@ import traceback
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-from .catalog import LANGUAGES, iso_code
+from .catalog import LANGUAGES, iso_code, language_label
 from .store import ProjectStore, atomic_json_write
 from .zast_bridge import ZastBridge
 
@@ -291,7 +291,7 @@ def status_markdown(project: dict[str, Any] | None, message: str = "") -> str:
         f"| Transcrição | {icons.get(project['stages'].get('transcription'), '⚪')} |",
     ]
     for code, state in project.get("languages", {}).items():
-        name = state.get("name", code.upper())
+        name = language_label(state.get("name", code.upper()))
         rows.append(f"| {name}: tradução | {icons.get(state.get('translation'), '⚪')} |")
         rows.append(f"| {name}: dublagem/MP3 | {icons.get(state.get('mp3') or state.get('dubbing'), '⚪')} |")
     if message:

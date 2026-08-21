@@ -36,12 +36,35 @@ LANGUAGES = {
     "Vietnamese": "vie_Latn",
 }
 
+# The engines use these stable English keys.  The interface, however, should
+# speak the user's language without invalidating projects created previously.
+LANGUAGE_LABELS = {
+    "Arabic": "Árabe", "Burmese": "Birmanês", "Chinese": "Chinês",
+    "Czech": "Tcheco", "Danish": "Dinamarquês", "Dutch": "Holandês",
+    "English": "Inglês", "Finnish": "Finlandês", "French": "Francês",
+    "German": "Alemão", "Greek": "Grego", "Hebrew": "Hebraico",
+    "Hindi": "Hindi", "Hungarian": "Húngaro", "Indonesian": "Indonésio",
+    "Italian": "Italiano", "Japanese": "Japonês", "Khmer": "Khmer",
+    "Korean": "Coreano", "Lao": "Laosiano", "Malay": "Malaio",
+    "Norwegian": "Norueguês", "Polish": "Polonês", "Portuguese": "Português",
+    "Romanian": "Romeno", "Russian": "Russo", "Spanish": "Espanhol",
+    "Swahili": "Suaíli", "Swedish": "Sueco", "Tagalog": "Tagalo",
+    "Thai": "Tailandês", "Turkish": "Turco", "Vietnamese": "Vietnamita",
+}
+
+LANGUAGE_CHOICES = [(LANGUAGE_LABELS[name], name) for name in LANGUAGES]
+
 SOURCE_LANGUAGES = [
     "Auto", "Portuguese", "English", "Spanish", "French", "German",
     "Italian", "Japanese", "Korean", "Chinese", "Russian", "Arabic",
     "Hindi", "Dutch", "Polish", "Turkish", "Swedish", "Czech",
     "Romanian", "Hungarian",
 ]
+
+SOURCE_LANGUAGE_LABELS = {"Auto": "Detectar automaticamente", **{
+    name: LANGUAGE_LABELS.get(name, name) for name in SOURCE_LANGUAGES if name != "Auto"
+}}
+SOURCE_LANGUAGE_CHOICES = [(SOURCE_LANGUAGE_LABELS[name], name) for name in SOURCE_LANGUAGES]
 
 SOURCE_LANGUAGE_CODES = {
     "Auto": None,
@@ -86,3 +109,8 @@ def iso_code(nllb_code: str) -> str:
     }
     prefix = (nllb_code or "").split("_")[0].lower()
     return mapping.get(prefix, prefix[:2])
+
+
+def language_label(language: str) -> str:
+    """Return the Portuguese label while accepting existing project keys."""
+    return LANGUAGE_LABELS.get(language, language)
