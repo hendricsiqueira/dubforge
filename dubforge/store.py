@@ -151,3 +151,55 @@ class ProjectStore:
     def _read_json(path: Path) -> dict[str, Any]:
         with path.open("r", encoding="utf-8") as handle:
             return json.load(handle)
+
+
+class BatchStore:
+    """Persistent queue metadata. Individual jobs remain normal projects."""
+
+    def __init__(self, root: str | Path):
+        self.root = Path(root).resolve()
+        self.root.mkdir(parents=True, exist_ok=True)
+
+    def list_batches(self) -> list[dict[str, Any]]:
+        batches: list[dict[str, Any]] = []
+        for manifest in self.root.glob("*.json"):
+            try:
+                batches.append(ProjectStore._read_json(manifest))
+            except (OSError, json.JSONDecodeError):
+                continue
+        return sorted(batches, key=lambda item: item.get("updated_at", ""), reverse=True)
+
+    def get(self, batch_id: str) -> dict[str, Any]:
+        manifest = self._path(batch_id)
+        if not manifest.exists():
+            raise FileNotFoundError(f"Lote não encontrado: {batch_id}")
+        return ProjectStore._read_json(manifest)
+
+    def create(self, name: str, project_ids: list[str]) -> dict[str, Any]:
+        now = utc_now()
+        base_id = slugify(name or "lote")
+        batch_id = base_id
+        suffix = 2
+        while self._path(batch_id).exists():
+            batch_id = f"{base_id}-{suffix}"
+            suffix += 1
+        data = {
+            "schema_version": 1,
+            "id": batch_id,
+            "name": name.strip() or "Lote de dublagem",
+            "created_at": now,
+            "updated_at": now,
+            "status": "pending",
+            "current_project_id": None,
+            "project_ids": project_ids,
+            "last_error": None,
+        }
+        self.save(data)
+        return data
+
+    def save(self, batch: dict[str, Any]) -> None:
+        batch["updated_at"] = utc_now()
+        atomic_json_write(self._path(batch["id"]), batch)
+
+    def _path(self, batch_id: str) -> Path:
+        return self.root / f"{slugify(batch_id)}.json"
