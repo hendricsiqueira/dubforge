@@ -18,6 +18,8 @@ cache e resultados em uma pasta separada.
 - aceita vários áudios ou vídeos em uma única fila;
 - termina todos os idiomas de um arquivo antes de iniciar o próximo;
 - salva a fila para ser retomada após erro, reinício ou desligamento da instância.
+- mede o tempo de preparação, transcrição, tradução e dublagem por idioma;
+- estima o custo da Vast em reais e compara com um serviço cobrado por minuto.
 
 ## Processamento em lote
 
@@ -29,6 +31,14 @@ um projeto independente para cada arquivo e uma fila persistente em
 Ele processa a fila em ordem: arquivo 1 em todos os idiomas, depois arquivo 2,
 e assim por diante. Para continuar uma fila interrompida, selecione-a em
 **Lote salvo** e clique em **Retomar lote selecionado**.
+
+## Métricas e custos
+
+Antes de iniciar, informe o custo total da instância em US$/hora, a cotação do
+dólar e o valor do serviço de comparação em R$/minuto por idioma. O painel de
+andamento mostra os tempos acumulados de cada operação, os minutos efetivamente
+dublados e a economia estimada. Essas métricas ficam salvas no `project.json` e
+continuam disponíveis ao reabrir o projeto ou retomar o lote.
 
 ## Estrutura esperada no Windows
 
