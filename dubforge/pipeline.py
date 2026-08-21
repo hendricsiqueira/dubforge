@@ -4,7 +4,9 @@ import json
 import hashlib
 import os
 import shutil
+import time
 import traceback
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
@@ -26,6 +28,8 @@ class DubPipeline:
         directory = self.store.project_dir(project_id)
         bridge = ZastBridge(self.zast_path, directory)
         settings = project["settings"]
+        started = time.perf_counter()
+        run_status = "failed"
         try:
             source_info = self._prepare_transcription(project, bridge, callback)
             translated = self._translate_all(project, bridge, source_info, callback)
@@ -33,6 +37,7 @@ class DubPipeline:
             project["last_error"] = None
             self.store.save(project)
             callback("done", "Processamento concluído", 1.0)
+            run_status = "completed"
             return outputs
         except Exception as exc:
             project["last_error"] = {
@@ -42,6 +47,7 @@ class DubPipeline:
             self.store.save(project)
             raise
         finally:
+            self._record_metric(project, "project_total", time.perf_counter() - started, run_status)
             bridge.release_vram()
 
     def _prepare_transcription(
@@ -74,13 +80,36 @@ class DubPipeline:
         project["stages"]["transcription"] = "running"
         self.store.save(project)
 
-        info = bridge.prepare_source(
-            project["source"]["path"],
-            settings["source_language"],
-            settings["whisper_model"],
-            settings["preserve_background"],
-            callback,
-        )
+        active_stage: str | None = None
+        active_started = 0.0
+
+        def close_stage(status: str = "completed") -> None:
+            nonlocal active_stage, active_started
+            if active_stage is not None:
+                self._record_metric(project, active_stage, time.perf_counter() - active_started, status)
+                active_stage = None
+
+        def timed_callback(stage: str, message: str, progress: float | None) -> None:
+            nonlocal active_stage, active_started
+            if stage in {"import", "separation", "transcription"} and stage != active_stage:
+                close_stage()
+                active_stage = stage
+                active_started = time.perf_counter()
+            callback(stage, message, progress)
+
+        try:
+            info = bridge.prepare_source(
+                project["source"]["path"],
+                settings["source_language"],
+                settings["whisper_model"],
+                settings["preserve_background"],
+                timed_callback,
+            )
+        except Exception:
+            close_stage("failed")
+            raise
+        else:
+            close_stage()
         segments = info.pop("segments")
         atomic_json_write(transcription_path, {
             "language": info.get("detected_language"),
@@ -141,13 +170,14 @@ class DubPipeline:
                 lang_state = project["languages"].setdefault(short_code, {"name": language})
                 lang_state["translation"] = "running"
                 self.store.save(project)
-                translated = bridge.translate_language(
-                    source_info["segments"],
-                    source_info.get("detected_language", "pt"),
-                    language,
-                    project["settings"]["llm_backend"],
-                    callback,
-                )
+                with self._measure(project, f"translation:{short_code}"):
+                    translated = bridge.translate_language(
+                        source_info["segments"],
+                        source_info.get("detected_language", "pt"),
+                        language,
+                        project["settings"]["llm_backend"],
+                        callback,
+                    )
                 path = directory / "translations" / f"{short_code}.json"
                 atomic_json_write(path, {
                     "language": language,
@@ -236,17 +266,18 @@ class DubPipeline:
 
                 lang_state["dubbing"] = "running"
                 self.store.save(project)
-                result = bridge.synthesize_language(
-                    translated[language],
-                    language,
-                    float(source_info["duration"]),
-                    settings.get("voice_file") or source_info.get("voice_reference"),
-                    source_info.get("background") if settings["preserve_background"] else None,
-                    settings["never_cut"],
-                    settings["bitrate"],
-                    source_stem,
-                    callback,
-                )
+                with self._measure(project, f"dubbing:{short_code}"):
+                    result = bridge.synthesize_language(
+                        translated[language],
+                        language,
+                        float(source_info["duration"]),
+                        settings.get("voice_file") or source_info.get("voice_reference"),
+                        source_info.get("background") if settings["preserve_background"] else None,
+                        settings["never_cut"],
+                        settings["bitrate"],
+                        source_stem,
+                        callback,
+                    )
                 lang_state["dubbing"] = "completed"
                 lang_state["mp3"] = "completed"
                 lang_state["signature"] = result["signature"]
@@ -275,6 +306,36 @@ class DubPipeline:
         stat = path.stat()
         return [str(path.resolve()), stat.st_size, stat.st_mtime_ns]
 
+    @contextmanager
+    def _measure(self, project: dict[str, Any], operation: str) -> Iterator[None]:
+        started = time.perf_counter()
+        status = "failed"
+        try:
+            yield
+            status = "completed"
+        finally:
+            self._record_metric(project, operation, time.perf_counter() - started, status)
+
+    def _record_metric(
+        self,
+        project: dict[str, Any],
+        operation: str,
+        seconds: float,
+        status: str,
+    ) -> None:
+        metrics = project.setdefault("metrics", {}).setdefault("operations", {})
+        entry = metrics.setdefault(operation, {
+            "total_seconds": 0.0,
+            "last_seconds": 0.0,
+            "runs": 0,
+            "status": "pending",
+        })
+        entry["total_seconds"] = round(float(entry.get("total_seconds", 0.0)) + seconds, 3)
+        entry["last_seconds"] = round(seconds, 3)
+        entry["runs"] = int(entry.get("runs", 0)) + 1
+        entry["status"] = status
+        self.store.save(project)
+
 
 def status_markdown(project: dict[str, Any] | None, message: str = "") -> str:
     if not project:
@@ -298,4 +359,71 @@ def status_markdown(project: dict[str, Any] | None, message: str = "") -> str:
         rows.extend(["", f"**Agora:** {message}"])
     if project.get("last_error"):
         rows.extend(["", f"**Último erro:** `{project['last_error'].get('message', '')}`"])
+    rows.extend(["", metrics_markdown([project])])
     return "\n".join(rows)
+
+
+def _duration(seconds: float) -> str:
+    total = max(0, round(float(seconds)))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def metrics_markdown(projects: list[dict[str, Any]], title: str = "Métricas e custos") -> str:
+    operations: dict[str, float] = {}
+    total_processing = 0.0
+    source_seconds = 0.0
+    output_seconds = 0.0
+    settings = projects[0].get("settings", {}) if projects else {}
+
+    labels = {
+        "import": "Importação/preparação",
+        "separation": "Separação (Demucs)",
+        "transcription": "Transcrição (WhisperX)",
+    }
+    for project in projects:
+        project_operations = project.get("metrics", {}).get("operations", {})
+        total_processing += float(project_operations.get("project_total", {}).get("total_seconds", 0.0))
+        duration = float(project.get("source", {}).get("duration") or 0.0)
+        source_seconds += duration
+        output_seconds += duration * len(project.get("settings", {}).get("target_languages", []))
+        for key, entry in project_operations.items():
+            if key == "project_total":
+                continue
+            operations[key] = operations.get(key, 0.0) + float(entry.get("total_seconds", 0.0))
+
+    lines = [f"### {title}", "| Operação | Tempo acumulado |", "|---|---:|"]
+    for key, seconds in operations.items():
+        if key.startswith("translation:"):
+            code = key.split(":", 1)[1]
+            language = next((language_label(p.get("name", code)) for project in projects for c, p in project.get("languages", {}).items() if c == code), code.upper())
+            label = f"Tradução — {language}"
+        elif key.startswith("dubbing:"):
+            code = key.split(":", 1)[1]
+            language = next((language_label(p.get("name", code)) for project in projects for c, p in project.get("languages", {}).items() if c == code), code.upper())
+            label = f"Dublagem/MP3 — {language}"
+        else:
+            label = labels.get(key, key)
+        lines.append(f"| {label} | {_duration(seconds)} |")
+    lines.append(f"| **Processamento total** | **{_duration(total_processing)}** |")
+
+    hourly_usd = float(settings.get("gpu_hourly_usd") or 0.0)
+    usd_brl = float(settings.get("usd_brl") or 0.0)
+    competitor_rate = float(settings.get("competitor_brl_per_minute") or 2.0)
+    vast_brl = total_processing / 3600 * hourly_usd * usd_brl
+    panda_brl = output_seconds / 60 * competitor_rate
+    lines.extend([
+        "",
+        f"- Áudio original: **{source_seconds / 60:.1f} min**",
+        f"- Minutos dublados (áudio × idiomas): **{output_seconds / 60:.1f} min**",
+    ])
+    if hourly_usd > 0 and usd_brl > 0:
+        lines.extend([
+            f"- Custo estimado da Vast: **R$ {vast_brl:.2f}**",
+            f"- Custo estimado no Panda: **R$ {panda_brl:.2f}**",
+            f"- Economia estimada: **R$ {max(0.0, panda_brl - vast_brl):.2f}**",
+        ])
+    else:
+        lines.append("- Informe o custo da Vast por hora para calcular o valor em reais.")
+    return "\n".join(lines)
