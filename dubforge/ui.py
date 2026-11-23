@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import os
-import threading
 from pathlib import Path
-from queue import Empty, Queue
-from typing import Any, Iterator
+from typing import Any
 
 import gradio as gr
 
@@ -15,16 +13,16 @@ from .catalog import (
     SOURCE_LANGUAGE_CHOICES,
     WHISPER_MODELS,
 )
-from .pipeline import DubPipeline, metrics_markdown, status_markdown
+from .jobs import JobManager
+from .pipeline import metrics_markdown, status_markdown
 from .store import BatchStore, ProjectStore
-
 
 APP_ROOT = Path(__file__).resolve().parents[1]
 PROJECTS_ROOT = Path(os.environ.get("DUBFORGE_PROJECTS_DIR", APP_ROOT / "projects")).resolve()
 ZAST_PATH = Path(os.environ.get("ZAST_TRANSLATE_PATH", APP_ROOT.parent / "ZastTranslate")).resolve()
 STORE = ProjectStore(PROJECTS_ROOT)
 BATCHES = BatchStore(PROJECTS_ROOT / "batches")
-PIPELINE_LOCK = threading.Lock()
+JOBS = JobManager(STORE, BATCHES, ZAST_PATH, PROJECTS_ROOT / "jobs")
 
 
 def project_choices() -> list[tuple[str, str]]:
@@ -60,6 +58,7 @@ def _settings(
     voice_file: str | None, sync_mode: str, bitrate: str, generate_srt: bool,
     preserve_background: bool, gpu_hourly_usd: float, usd_brl: float,
     competitor_brl_per_minute: float,
+    adaptive_mode: str = "Automático",
 ) -> dict[str, Any]:
     return {
         "source_language": source_language,
@@ -76,7 +75,132 @@ def _settings(
         "competitor_brl_per_minute": float(competitor_brl_per_minute or 2.0),
         "llm_backend": "Qwen2.5-7B-Instruct",
         "tts_backend": "VoxCPM 2",
+        "adaptive_mode": adaptive_mode,
     }
+
+
+def _format_seconds(value: float | None) -> str:
+    if value is None:
+        return "calculando…"
+    total = max(0, round(float(value)))
+    hours, remainder = divmod(total, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+
+
+def job_markdown(job: dict[str, Any] | None) -> str:
+    if not job:
+        return "Nenhum trabalho iniciado."
+    status_labels = {
+        "pending": "⚪ Na fila", "running": "🔵 Em execução",
+        "pause_requested": "🟡 Pausando", "paused": "⏸️ Pausado",
+        "waiting_for_disk": "🟠 Aguardando espaço", "cancelling": "🟡 Cancelando",
+        "cancelled": "⚫ Cancelado", "completed": "✅ Concluído", "failed": "🔴 Falhou",
+    }
+    overall = float(job.get("overall_progress", 0.0))
+    stage_progress = float(job.get("stage_progress", 0.0))
+    resource = job.get("resource", {})
+    adaptive = job.get("adaptive", {})
+    lines = [
+        f"## {job.get('name', 'Trabalho')}",
+        f"**Status:** {status_labels.get(job.get('status'), job.get('status'))}",
+        f"**Progresso geral estimado:** {overall * 100:.1f}%",
+        f"**Etapa atual:** {job.get('stage', '—')} · {stage_progress * 100:.1f}%",
+        f"**Agora:** {job.get('message', '—')}",
+    ]
+    if job.get("current_language"):
+        lines.append(f"**Idioma:** {job['current_language']}")
+    if job.get("items_total"):
+        lines.append(f"**Itens:** {job.get('items_done', 0)}/{job['items_total']}")
+    lines.extend([
+        f"**Tempo restante estimado:** {_format_seconds(job.get('eta_seconds'))}",
+        "",
+        "### Recursos e modo automático",
+        "| Recurso | Estado |",
+        "|---|---:|",
+        f"| GPU | {resource.get('gpu_name') or 'não detectada'} |",
+        f"| Uso da GPU | {resource.get('gpu_utilization', 0) or 0:.0f}% |",
+        f"| VRAM | {resource.get('gpu_vram_used_gb', 0) or 0:.1f}/{resource.get('gpu_vram_total_gb', 0) or 0:.1f} GB |",
+        f"| RAM disponível | {resource.get('ram_available_gb', 0) or 0:.1f} GB |",
+        f"| Disco livre | {resource.get('disk_free_gb', 0) or 0:.1f} GB |",
+        f"| Trabalhadores VoxCPM | {adaptive.get('tts_workers', 1)} |",
+        f"| Lote Qwen | {adaptive.get('translation_batch_size', 8)} |",
+    ])
+    project_id = job.get("current_project_id")
+    if project_id:
+        try:
+            project = STORE.get(project_id)
+            progress = project.get("progress", {})
+            stages = progress.get("stages", {})
+            if stages:
+                lines.extend(["", "### Medidas do projeto", "| Etapa | Concluído | Medida |", "|---|---:|---:|"])
+                labels = {
+                    "preparation": "Preparação", "separation": "Demucs",
+                    "transcription": "WhisperX", "translation": "Tradução",
+                    "dubbing": "Dublagem", "export": "Mixagem/MP3",
+                }
+                for key in ["preparation", "separation", "transcription", "translation", "dubbing", "export"]:
+                    item = stages.get(key)
+                    if not item:
+                        continue
+                    lines.append(
+                        f"| {labels[key]} | {float(item.get('progress', 0)) * 100:.1f}% | "
+                        f"{item.get('done', 0):.0f}/{item.get('total', 0):.0f} |"
+                    )
+            lines.extend(["", metrics_markdown([project])])
+        except (FileNotFoundError, OSError):
+            pass
+    if job.get("last_error"):
+        lines.extend(["", f"**Erro:** `{job['last_error']}`"])
+    return "\n".join(lines)
+
+
+def _job_outputs(job: dict[str, Any] | None) -> list[str]:
+    if not job:
+        return []
+    paths = list(job.get("outputs", []))
+    project_id = job.get("current_project_id")
+    if project_id:
+        paths.extend(str(path) for path in STORE.project_dir(project_id).glob("outputs/**/*") if path.is_file())
+    if job.get("kind") == "batch":
+        try:
+            batch = BATCHES.get(job["target_id"])
+            for item_id in batch["project_ids"]:
+                paths.extend(str(path) for path in STORE.project_dir(item_id).glob("outputs/**/*") if path.is_file())
+        except FileNotFoundError:
+            pass
+    return sorted(set(paths))
+
+
+def poll_job(job_id: str | None):
+    try:
+        job = JOBS.jobs.get(job_id) if job_id else JOBS.latest()
+    except FileNotFoundError:
+        job = JOBS.latest()
+    if not job:
+        return job_markdown(None), [], "Aguardando", ""
+    return job_markdown(job), _job_outputs(job), job.get("message", ""), job["id"]
+
+
+def pause_job(job_id: str):
+    if not job_id:
+        raise gr.Error("Nenhum trabalho ativo.")
+    JOBS.pause(job_id)
+    return poll_job(job_id)
+
+
+def resume_job(job_id: str):
+    if not job_id:
+        raise gr.Error("Nenhum trabalho selecionado.")
+    JOBS.resume(job_id)
+    return poll_job(job_id)
+
+
+def cancel_job(job_id: str):
+    if not job_id:
+        raise gr.Error("Nenhum trabalho ativo.")
+    JOBS.cancel(job_id)
+    return poll_job(job_id)
 
 
 def load_project(project_id: str):
@@ -108,7 +232,7 @@ def refresh_batches():
     return gr.update(choices=batch_choices())
 
 
-def run_project(
+def enqueue_project_job(
     selected_project: str,
     project_name: str,
     source_file: str | list[str] | None,
@@ -124,7 +248,8 @@ def run_project(
     gpu_hourly_usd: float,
     usd_brl: float,
     competitor_brl_per_minute: float,
-) -> Iterator[tuple[str, list[str], Any, str]]:
+    adaptive_mode: str,
+):
     if not target_languages:
         raise gr.Error("Selecione pelo menos um idioma de destino.")
     source_paths = _source_paths(source_file)
@@ -138,160 +263,42 @@ def run_project(
     settings = _settings(
         source_language, whisper_model, target_languages, voice_mode, voice_file,
         sync_mode, bitrate, generate_srt, preserve_background, gpu_hourly_usd,
-        usd_brl, competitor_brl_per_minute,
+        usd_brl, competitor_brl_per_minute, adaptive_mode,
     )
+    if selected_project == "__new__" and len(source_paths) > 1:
+        projects = []
+        for path in source_paths:
+            project = STORE.create(Path(path).stem, path, settings)
+            item_settings = STORE.persist_voice_file(project, dict(settings))
+            STORE.update_settings(project, item_settings)
+            projects.append(project)
+        batch = BATCHES.create(project_name or "Lote de dublagem", [item["id"] for item in projects])
+        job = JOBS.submit_batch(batch["id"], adaptive_mode)
+        return job_markdown(job), [], gr.update(choices=project_choices()), job["message"], job["id"]
+
     if selected_project == "__new__":
-        if len(source_paths) > 1:
-            projects = []
-            for path in source_paths:
-                project = STORE.create(Path(path).stem, path, settings)
-                item_settings = STORE.persist_voice_file(project, dict(settings))
-                STORE.update_settings(project, item_settings)
-                projects.append(project)
-            batch = BATCHES.create(project_name or "Lote de dublagem", [item["id"] for item in projects])
-            yield from run_batch(batch["id"], update_batch_selector=False)
-            return
         project = STORE.create(project_name, source_paths[0], settings)
-        settings = STORE.persist_voice_file(project, settings)
-        STORE.update_settings(project, settings)
     else:
         project = STORE.get(selected_project)
-        settings = STORE.persist_voice_file(project, settings)
-        STORE.update_settings(project, settings)
-
-    if not PIPELINE_LOCK.acquire(blocking=False):
-        raise gr.Error("Já existe um processamento em andamento.")
-
-    queue: Queue[tuple[str, Any]] = Queue()
-
-    def callback(stage: str, message: str, progress: float | None) -> None:
-        queue.put(("progress", (stage, message, progress)))
-
-    def worker() -> None:
-        try:
-            outputs = DubPipeline(STORE, ZAST_PATH).run(project["id"], callback)
-            queue.put(("done", outputs))
-        except Exception as exc:
-            queue.put(("error", exc))
-        finally:
-            PIPELINE_LOCK.release()
-
-    threading.Thread(target=worker, daemon=True).start()
-    outputs: list[str] = []
-    yield status_markdown(project, "Preparando o projeto"), outputs, gr.update(choices=project_choices(), value=project["id"]), "Preparando…"
-
-    while True:
-        try:
-            kind, payload = queue.get(timeout=5.0)
-        except Empty:
-            current = STORE.get(project["id"])
-            yield status_markdown(current, "Processando… acompanhe também o terminal"), outputs, gr.update(), "Processando…"
-            continue
-        current = STORE.get(project["id"])
-        if kind == "progress":
-            _, message, progress = payload
-            label = message if progress is None else f"{message} · {int(progress * 100)}%"
-            yield status_markdown(current, label), outputs, gr.update(), label
-        elif kind == "done":
-            outputs = payload
-            yield status_markdown(STORE.get(project["id"]), "Concluído"), outputs, gr.update(choices=project_choices(), value=project["id"]), "Concluído"
-            return
-        else:
-            message = str(payload)
-            yield status_markdown(current, f"Erro: {message}"), outputs, gr.update(choices=project_choices(), value=project["id"]), f"Erro: {message}"
-            return
+    settings = STORE.persist_voice_file(project, settings)
+    STORE.update_settings(project, settings)
+    job = JOBS.submit_project(project["id"], adaptive_mode)
+    return (
+        job_markdown(job), _job_outputs(job),
+        gr.update(choices=project_choices(), value=project["id"]),
+        job["message"], job["id"],
+    )
 
 
-def batch_status_markdown(batch: dict[str, Any], project: dict[str, Any] | None, message: str = "") -> str:
-    total = len(batch["project_ids"])
-    current_index = 0
-    if batch.get("current_project_id") in batch["project_ids"]:
-        current_index = batch["project_ids"].index(batch["current_project_id"]) + 1
-    header = f"## Lote: {batch['name']}\n**Status:** {batch['status']} · **Arquivo atual:** {current_index}/{total}"
-    projects = [
-        STORE.get(project_id) for project_id in batch["project_ids"]
-        if (STORE.project_dir(project_id) / "project.json").exists()
-    ]
-    current = f"{header}\n\n{status_markdown(project, message)}" if project else header
-    return f"{current}\n\n{metrics_markdown(projects, 'Totais do lote')}" if projects else current
-
-
-def run_batch(batch_id: str, update_batch_selector: bool = True) -> Iterator[tuple[str, list[str], Any, str]]:
+def enqueue_batch_job(batch_id: str, adaptive_mode: str):
     if not batch_id:
         raise gr.Error("Selecione um lote para retomar.")
-    if not ZAST_PATH.exists():
-        raise gr.Error(f"ZastTranslate não encontrado em: {ZAST_PATH}")
-    if not PIPELINE_LOCK.acquire(blocking=False):
-        raise gr.Error("Já existe um processamento em andamento.")
-
-    queue: Queue[tuple[str, Any]] = Queue()
-
-    def worker() -> None:
-        all_outputs: list[str] = []
-        try:
-            batch = BATCHES.get(batch_id)
-            batch["status"] = "running"
-            batch["last_error"] = None
-            BATCHES.save(batch)
-            for index, project_id in enumerate(batch["project_ids"], 1):
-                batch["current_project_id"] = project_id
-                BATCHES.save(batch)
-
-                def callback(stage: str, message: str, progress: float | None, *, number=index, total=len(batch["project_ids"])) -> None:
-                    queue.put(("progress", (project_id, number, total, stage, message, progress)))
-
-                all_outputs.extend(DubPipeline(STORE, ZAST_PATH).run(project_id, callback))
-            batch["status"] = "completed"
-            batch["current_project_id"] = None
-            BATCHES.save(batch)
-            queue.put(("done", sorted(set(all_outputs))))
-        except Exception as exc:
-            batch = BATCHES.get(batch_id)
-            batch["status"] = "failed"
-            batch["last_error"] = str(exc)
-            BATCHES.save(batch)
-            queue.put(("error", exc))
-        finally:
-            PIPELINE_LOCK.release()
-
-    threading.Thread(target=worker, daemon=True).start()
-    yield batch_status_markdown(BATCHES.get(batch_id), None, "Preparando fila"), [], gr.update(), "Preparando lote…"
-
-    while True:
-        try:
-            kind, payload = queue.get(timeout=5.0)
-        except Empty:
-            batch = BATCHES.get(batch_id)
-            current = STORE.get(batch["current_project_id"]) if batch.get("current_project_id") else None
-            yield batch_status_markdown(batch, current, "Processando… acompanhe também o terminal"), [], gr.update(), "Processando lote…"
-            continue
-        batch = BATCHES.get(batch_id)
-        if kind == "progress":
-            project_id, number, total, _, message, progress = payload
-            label = f"Arquivo {number}/{total}: {message}"
-            if progress is not None:
-                label += f" · {int(progress * 100)}%"
-            yield batch_status_markdown(batch, STORE.get(project_id), label), [], gr.update(), label
-        elif kind == "done":
-            selector = (
-                gr.update(choices=batch_choices(), value=batch_id)
-                if update_batch_selector else gr.update(choices=project_choices())
-            )
-            yield batch_status_markdown(batch, None, "Lote concluído"), payload, selector, "Lote concluído"
-            return
-        else:
-            message = str(payload)
-            current = STORE.get(batch["current_project_id"]) if batch.get("current_project_id") else None
-            selector = (
-                gr.update(choices=batch_choices(), value=batch_id)
-                if update_batch_selector else gr.update(choices=project_choices())
-            )
-            yield batch_status_markdown(batch, current, f"Erro: {message}"), [], selector, f"Erro: {message}"
-            return
-
-
-def resume_batch(batch_id: str) -> Iterator[tuple[str, list[str], Any, str]]:
-    yield from run_batch(batch_id, update_batch_selector=True)
+    job = JOBS.submit_batch(batch_id, adaptive_mode)
+    return (
+        job_markdown(job), _job_outputs(job),
+        gr.update(choices=batch_choices(), value=batch_id),
+        job["message"], job["id"],
+    )
 
 
 CSS = """
@@ -307,6 +314,8 @@ CSS = """
 
 def build_ui() -> gr.Blocks:
     with gr.Blocks(title="DubForge", css=CSS, theme=gr.themes.Soft(primary_hue="violet")) as demo:
+        active_job = gr.State("")
+        timer = gr.Timer(value=2.0, active=True)
         gr.HTML("<div class='df-hero'><h1>DubForge</h1><p>Local AI Dubbing Studio · MP3 + SRT · processamento em lote com retomada automática</p></div>")
         with gr.Row():
             with gr.Column(scale=6, elem_classes="df-card"):
@@ -336,19 +345,29 @@ def build_ui() -> gr.Blocks:
                     gpu_hourly_usd = gr.Number(value=0.0, label="Custo total Vast (US$/hora)", minimum=0)
                     usd_brl = gr.Number(value=5.50, label="Cotação US$ → R$", minimum=0)
                     competitor_brl_per_minute = gr.Number(value=2.0, label="Panda (R$/min por idioma)", minimum=0)
+                adaptive_mode = gr.Radio(
+                    ["Automático", "Econômico", "Equilibrado", "Máximo"],
+                    value="Automático",
+                    label="Desempenho",
+                    info="Automático ajusta Qwen e trabalhadores VoxCPM conforme VRAM, RAM e disco.",
+                )
                 run_btn = gr.Button("🚀 Dublar / retomar", variant="primary", elem_classes="df-run")
                 with gr.Row():
                     batch_select = gr.Dropdown(batch_choices(), value="", label="Lote salvo")
                     refresh_batches_btn = gr.Button("Atualizar lotes")
                 resume_batch_btn = gr.Button("▶ Retomar lote selecionado")
+                with gr.Row():
+                    pause_btn = gr.Button("⏸ Pausar")
+                    continue_btn = gr.Button("▶ Continuar")
+                    cancel_btn = gr.Button("⏹ Cancelar")
                 live_status = gr.Textbox(label="Status atual", value="Aguardando", interactive=False)
 
             with gr.Column(scale=4, elem_classes="df-card"):
-                status = gr.Markdown(status_markdown(None), label="Andamento")
+                status = gr.Markdown(job_markdown(JOBS.latest()), label="Andamento")
                 outputs = gr.File(label="Arquivos gerados", file_count="multiple", interactive=False)
                 gr.Markdown(
-                    "O DubForge salva a transcrição, cada tradução e cada segmento de áudio. "
-                    "Se o computador reiniciar, selecione o mesmo projeto e clique em **Dublar / retomar**."
+                    "A página pode ser fechada sem interromper o trabalho. Ao abrir novamente, "
+                    "o painel se reconecta ao gerenciador persistente. O DubForge preserva cada checkpoint."
                 )
 
         load_outputs = [
@@ -361,16 +380,31 @@ def build_ui() -> gr.Blocks:
         refresh_btn.click(refresh_projects, outputs=[project_select])
         refresh_batches_btn.click(refresh_batches, outputs=[batch_select])
         run_btn.click(
-            run_project,
+            enqueue_project_job,
             [project_select, project_name, source_file, source_language, whisper_model,
              target_languages, voice_mode, voice_file, sync_mode, bitrate,
              generate_srt, preserve_background, gpu_hourly_usd, usd_brl,
-             competitor_brl_per_minute],
-            [status, outputs, project_select, live_status],
+             competitor_brl_per_minute, adaptive_mode],
+            [status, outputs, project_select, live_status, active_job],
         )
         resume_batch_btn.click(
-            resume_batch,
-            [batch_select],
-            [status, outputs, batch_select, live_status],
+            enqueue_batch_job,
+            [batch_select, adaptive_mode],
+            [status, outputs, batch_select, live_status, active_job],
+        )
+        pause_btn.click(
+            pause_job, [active_job], [status, outputs, live_status, active_job], show_progress="hidden"
+        )
+        continue_btn.click(
+            resume_job, [active_job], [status, outputs, live_status, active_job], show_progress="hidden"
+        )
+        cancel_btn.click(
+            cancel_job, [active_job], [status, outputs, live_status, active_job], show_progress="hidden"
+        )
+        timer.tick(
+            poll_job, [active_job], [status, outputs, live_status, active_job], show_progress="hidden"
+        )
+        demo.load(
+            poll_job, [active_job], [status, outputs, live_status, active_job], show_progress="hidden"
         )
     return demo
