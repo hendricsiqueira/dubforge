@@ -145,7 +145,9 @@ O instalador:
 - instala FFmpeg, Git, tmux e bibliotecas do sistema;
 - baixa o ZastTranslate na revisão compatível `a567da7...`;
 - cria `/workspace/dubforge-env`;
-- instala PyTorch 2.8.0 com CUDA 12.6, WhisperX e VoxCPM 2;
+- instala WhisperX e VoxCPM 2;
+- detecta RTX 50/Blackwell e usa PyTorch 2.8.0 CUDA 12.8;
+- mantém CUDA 12.6 nas RTX 40/Ada já validadas;
 - configura o `.env`;
 - verifica GPU, imports e executa os 17 testes do DubForge.
 

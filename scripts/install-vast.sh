@@ -43,10 +43,17 @@ echo "[5/8] Instalando ZastTranslate, WhisperX e VoxCPM"
 "$PYTHON_BIN" -m pip install "voxcpm>=2.0.2" \
   -c "$ZAST_DIR/constraints-linux.txt"
 
-echo "[6/8] Instalando PyTorch CUDA 12.6 validado anteriormente"
+GPU_NAME="$(nvidia-smi --query-gpu=name --format=csv,noheader | head -n 1 || true)"
+if [[ "$GPU_NAME" =~ RTX[[:space:]]50[0-9][0-9] ]]; then
+  TORCH_CUDA_INDEX="cu128"
+  echo "[6/8] GPU Blackwell detectada ($GPU_NAME): usando PyTorch CUDA 12.8"
+else
+  TORCH_CUDA_INDEX="cu126"
+  echo "[6/8] GPU Ada/compatível detectada ($GPU_NAME): usando PyTorch CUDA 12.6"
+fi
 "$PYTHON_BIN" -m pip install \
   torch==2.8.0 torchvision==0.23.0 torchaudio==2.8.0 \
-  --index-url https://download.pytorch.org/whl/cu126 \
+  --index-url "https://download.pytorch.org/whl/$TORCH_CUDA_INDEX" \
   --force-reinstall --no-deps
 
 if [[ "${DUBFORGE_INSTALL_FLASH_ATTN:-0}" == "1" ]]; then
