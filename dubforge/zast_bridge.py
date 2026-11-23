@@ -5,14 +5,15 @@ import hashlib
 import importlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from .catalog import LANGUAGES, SOURCE_LANGUAGE_CODES, iso_code
-
 
 ProgressCallback = Callable[[str, str, float | None], None]
 
@@ -168,13 +169,27 @@ class ZastBridge:
         target_language: str,
         llm_backend: str,
         callback: ProgressCallback,
+        generate_normal: bool = True,
+        batch_size: int | None = None,
+        prefer_pytorch: bool = True,
     ) -> list[dict[str, Any]]:
         import copy
 
         target_code = LANGUAGES[target_language]
         short_code = iso_code(target_code)
         cps = self.cps_module.get_fitted_cps(short_code)
+        if batch_size:
+            # Newer ZastTranslate builds read this value. Older builds safely ignore it.
+            os.environ["ZAST_TRANSLATION_BATCH_SIZE"] = str(max(1, int(batch_size)))
         reformulator = self.reformulator_module.Reformulator(backend_name=llm_backend)
+        if prefer_pytorch:
+            # AcceleratedLLMBackend otherwise prefers GGUF when it is the only cached
+            # model. GGUF's current generate_batch is a serial loop; the PyTorch NF4
+            # backend performs one true padded CUDA batch.
+            backend = getattr(reformulator, "llm", None)
+            if backend is not None and hasattr(backend, "gguf_repo"):
+                backend.gguf_repo = None
+                backend.gguf_file = None
         translated = copy.deepcopy(segments)
         callback(short_code, f"Traduzindo e ajustando {target_language}", None)
         translated = reformulator.translate_segments(
@@ -196,8 +211,13 @@ class ZastBridge:
                     segment["translated_text"] = shorter
                     segment["reformulated"] = True
 
-        callback(short_code, f"Gerando legenda natural em {target_language}", None)
-        reformulator.translate_normal(translated, source_language_code, target_code)
+        if generate_normal:
+            callback(short_code, f"Gerando legenda natural em {target_language}", 0.82)
+            reformulator.translate_normal(translated, source_language_code, target_code)
+        else:
+            for segment in translated:
+                segment["normal_text"] = segment.get("translated_text", "")
+        callback(short_code, f"Tradução de {target_language} concluída", 1.0)
         return translated
 
     def unload_llm(self, llm_backend: str) -> None:
@@ -232,27 +252,57 @@ class ZastBridge:
         callback(short_code, f"Carregando VoxCPM 2 para {target_language}", None)
         tts.load(ref_audio_path=voice_reference)
 
+        # TimeSync does not expose segment progress. Instrument the backend at the
+        # common generate boundary and count each unique segment only once, so
+        # retries do not inflate the percentage.
+        original_generate = tts.generate
+        completed_segments: set[str] = set()
+        total_segments = max(1, len(translated))
+
+        def tracked_generate(*args: Any, **kwargs: Any):
+            result = original_generate(*args, **kwargs)
+            output_value = kwargs.get("output_path")
+            if output_value is None and len(args) >= 3:
+                output_value = args[2]
+            name = Path(str(output_value or "")).name
+            match = re.search(r"seg_[^_]+_([0-9]+(?:\.[0-9]+)?)_", name)
+            key = match.group(1) if match else name
+            if key and key not in completed_segments:
+                completed_segments.add(key)
+                done = min(len(completed_segments), total_segments)
+                callback(
+                    short_code,
+                    f"{target_language}: segmento {done}/{total_segments}",
+                    done / total_segments,
+                )
+            return result
+
+        tts.generate = tracked_generate
+
         # Deliberately do not attach the LLM here. This guarantees that Qwen is
         # not reloaded while VoxCPM occupies VRAM on 12 GB cards.
         time_sync = self.time_sync_module.TimeSync(tts, reformulator=None)
         callback(short_code, f"Gerando a voz em {target_language}", None)
-        if never_cut:
-            synced, stats = time_sync.sync_all_never_cut(
-                translated, short_code, duration, voice_mapping=None, gender="Woman"
-            )
-            voice_track = time_sync.build_full_audio(
-                synced, duration, use_real_positions=True
-            )
-        else:
-            translated, _ = time_sync.pre_check_and_shorten(translated, target_code)
-            synced, stats = time_sync.sync_all(
-                translated,
-                short_code,
-                voice_mapping=None,
-                total_duration=duration,
-                gender="Woman",
-            )
-            voice_track = time_sync.build_full_audio(synced, duration)
+        try:
+            if never_cut:
+                synced, stats = time_sync.sync_all_never_cut(
+                    translated, short_code, duration, voice_mapping=None, gender="Woman"
+                )
+                voice_track = time_sync.build_full_audio(
+                    synced, duration, use_real_positions=True
+                )
+            else:
+                translated, _ = time_sync.pre_check_and_shorten(translated, target_code)
+                synced, stats = time_sync.sync_all(
+                    translated,
+                    short_code,
+                    voice_mapping=None,
+                    total_duration=duration,
+                    gender="Woman",
+                )
+                voice_track = time_sync.build_full_audio(synced, duration)
+        finally:
+            tts.generate = original_generate
 
         output_dir = self.project_dir / "outputs" / short_code
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -274,6 +324,7 @@ class ZastBridge:
             capture_output=True,
         )
         os.replace(temp_mp3, mp3_path)
+        callback(short_code, f"{target_language} concluído", 1.0)
         return {
             "mp3": str(mp3_path),
             "stats": stats,
@@ -323,5 +374,7 @@ class ZastBridge:
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
                 torch.cuda.ipc_collect()
+            elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+                torch.mps.empty_cache()
         except Exception:
             pass

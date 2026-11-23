@@ -1,33 +1,43 @@
 from __future__ import annotations
 
-import json
 import hashlib
+import inspect
+import json
+import multiprocessing
 import os
-import shutil
 import time
 import traceback
+from collections.abc import Callable, Iterator
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any
 
 from .catalog import LANGUAGES, iso_code, language_label
+from .progress import ProjectProgress
+from .resources import AdaptiveScheduler, ResourceMonitor
 from .store import ProjectStore, atomic_json_write
+from .tts_worker import synthesize_task
 from .zast_bridge import ZastBridge
 
-
 EventCallback = Callable[[str, str, float | None], None]
+
+
+class PipelineInterrupted(RuntimeError):
+    """Control-flow signal that must never trigger a computational fallback."""
 
 
 class DubPipeline:
     def __init__(self, store: ProjectStore, zast_path: str | Path):
         self.store = store
         self.zast_path = Path(zast_path).expanduser().resolve()
+        self.progress: ProjectProgress | None = None
 
     def run(self, project_id: str, callback: EventCallback) -> list[str]:
         project = self.store.get(project_id)
         directory = self.store.project_dir(project_id)
         bridge = ZastBridge(self.zast_path, directory)
-        settings = project["settings"]
+        self.progress = ProjectProgress(self.store, project, callback)
         started = time.perf_counter()
         run_status = "failed"
         try:
@@ -36,7 +46,7 @@ class DubPipeline:
             outputs = self._synthesize_all(project, bridge, source_info, translated, callback)
             project["last_error"] = None
             self.store.save(project)
-            callback("done", "Processamento concluído", 1.0)
+            self.progress.finish()
             run_status = "completed"
             return outputs
         except Exception as exc:
@@ -71,7 +81,11 @@ class DubPipeline:
             info = json.loads(info_path.read_text(encoding="utf-8"))
             transcription = json.loads(transcription_path.read_text(encoding="utf-8"))
             if transcription.get("signature") == transcription_signature:
-                callback("transcription", "Transcrição encontrada; reutilizando o cache", 0.25)
+                assert self.progress is not None
+                self.progress.set("preparation", "Preparação encontrada no cache", 1, 1, force=True)
+                if settings["preserve_background"]:
+                    self.progress.set("separation", "Separação encontrada no cache", 1, 1, force=True)
+                self.progress.set("transcription", "Transcrição encontrada; reutilizando o cache", 1, 1, force=True)
                 info["segments"] = transcription["segments"]
                 return info
 
@@ -95,7 +109,11 @@ class DubPipeline:
                 close_stage()
                 active_stage = stage
                 active_started = time.perf_counter()
-            callback(stage, message, progress)
+            assert self.progress is not None
+            mapped = "preparation" if stage == "import" else stage
+            # The reused engine reports coarse global markers rather than
+            # stage-local percentages. Keep a truthful 0/100 stage state.
+            self.progress.set(mapped, message, 0, 1)
 
         try:
             info = bridge.prepare_source(
@@ -125,6 +143,11 @@ class DubPipeline:
         project["stages"]["separation"] = "completed" if settings["preserve_background"] else "skipped"
         project["stages"]["transcription"] = "completed"
         self.store.save(project)
+        assert self.progress is not None
+        self.progress.set("preparation", "Importação e preparação concluídas", 1, 1, force=True)
+        if settings["preserve_background"]:
+            self.progress.set("separation", "Separação de voz e ambiente concluída", 1, 1, force=True)
+        self.progress.set("transcription", "Transcrição concluída", 1, 1, force=True)
         return info
 
     def _translate_all(
@@ -138,6 +161,7 @@ class DubPipeline:
         targets = project["settings"]["target_languages"]
         completed: dict[str, list[dict[str, Any]]] = {}
         pending = []
+        assert self.progress is not None
         transcription_signature = self._signature({
             "language": source_info.get("detected_language"),
             "segments": [
@@ -164,19 +188,56 @@ class DubPipeline:
             else:
                 pending.append((language, expected_signature))
 
+        completed_count = len(completed)
+        total_targets = max(1, len(targets))
+        self.progress.set(
+            "translation",
+            f"{completed_count}/{len(targets)} idiomas traduzidos",
+            completed_count,
+            total_targets,
+            force=True,
+        )
         try:
             for index, (language, translation_signature) in enumerate(pending):
                 short_code = iso_code(LANGUAGES[language])
                 lang_state = project["languages"].setdefault(short_code, {"name": language})
                 lang_state["translation"] = "running"
                 self.store.save(project)
+                language_base = completed_count + index
+
+                def language_callback(
+                    stage: str,
+                    message: str,
+                    stage_progress: float | None,
+                    *,
+                    base: int = language_base,
+                    current_language: str = language,
+                ) -> None:
+                    fraction = 0.0 if stage_progress is None else min(1.0, max(0.0, float(stage_progress)))
+                    self.progress.set(
+                        "translation",
+                        message,
+                        base + fraction,
+                        total_targets,
+                        language=current_language,
+                    )
+
                 with self._measure(project, f"translation:{short_code}"):
+                    translate_kwargs: dict[str, Any] = {}
+                    parameters = inspect.signature(bridge.translate_language).parameters
+                    if "generate_normal" in parameters:
+                        translate_kwargs.update({
+                            "generate_normal": project["settings"].get("generate_srt", True),
+                            "batch_size": int(project.get("runtime", {}).get("adaptive", {}).get("translation_batch_size", 8)),
+                            "prefer_pytorch": True,
+                        })
                     translated = bridge.translate_language(
                         source_info["segments"],
                         source_info.get("detected_language", "pt"),
                         language,
                         project["settings"]["llm_backend"],
-                        callback,
+                        language_callback,
+                        **translate_kwargs,
                     )
                 path = directory / "translations" / f"{short_code}.json"
                 atomic_json_write(path, {
@@ -192,6 +253,14 @@ class DubPipeline:
                 lang_state["srt"] = "completed" if project["settings"].get("generate_srt", True) else "skipped"
                 lang_state["translation_signature"] = translation_signature
                 self.store.save(project)
+                self.progress.set(
+                    "translation",
+                    f"Tradução de {language} concluída",
+                    language_base + 1,
+                    total_targets,
+                    language=language,
+                    force=True,
+                )
         finally:
             if pending:
                 # The same backend instance is cached by ZastTranslate's factory.
@@ -200,6 +269,7 @@ class DubPipeline:
                     bridge.unload_llm(project["settings"]["llm_backend"])
                 except Exception:
                     bridge.release_vram()
+        self.progress.complete("translation", "Todas as traduções foram concluídas")
         return completed
 
     def _write_srt(
@@ -241,51 +311,184 @@ class DubPipeline:
         settings = project["settings"]
         outputs: list[str] = []
         source_stem = Path(project["source"]["original_name"]).stem
-        try:
-            for language in settings["target_languages"]:
-                short_code = iso_code(LANGUAGES[language])
-                lang_state = project["languages"].setdefault(short_code, {"name": language})
-                srt_path = directory / "outputs" / short_code / f"{source_stem}_{short_code}.srt"
-                if srt_path.exists() and settings.get("generate_srt", True):
-                    outputs.append(str(srt_path))
+        assert self.progress is not None
+        voice_reference = settings.get("voice_file") or source_info.get("voice_reference")
+        background_path = source_info.get("background") if settings["preserve_background"] else None
+        total_segments = sum(len(translated[language]) for language in settings["target_languages"])
+        total_segments = max(1, total_segments)
+        fractions: dict[str, float] = {}
+        plans: list[dict[str, Any]] = []
 
-                mp3_path = directory / "outputs" / short_code / f"{source_stem}_{short_code}.mp3"
-                expected_signature = bridge._synthesis_signature(
-                    translated[language],
-                    settings.get("voice_file") or source_info.get("voice_reference"),
-                    settings["never_cut"],
-                    settings["bitrate"],
-                    settings["preserve_background"],
-                )
-                if mp3_path.exists() and lang_state.get("signature") == expected_signature:
-                    lang_state["dubbing"] = "completed"
-                    lang_state["mp3"] = "completed"
-                    outputs.append(str(mp3_path))
-                    callback(short_code, f"MP3 de {language} já concluído", None)
-                    continue
-
-                lang_state["dubbing"] = "running"
-                self.store.save(project)
-                with self._measure(project, f"dubbing:{short_code}"):
-                    result = bridge.synthesize_language(
-                        translated[language],
-                        language,
-                        float(source_info["duration"]),
-                        settings.get("voice_file") or source_info.get("voice_reference"),
-                        source_info.get("background") if settings["preserve_background"] else None,
-                        settings["never_cut"],
-                        settings["bitrate"],
-                        source_stem,
-                        callback,
-                    )
+        for language in settings["target_languages"]:
+            short_code = iso_code(LANGUAGES[language])
+            lang_state = project["languages"].setdefault(short_code, {"name": language})
+            srt_path = directory / "outputs" / short_code / f"{source_stem}_{short_code}.srt"
+            if srt_path.exists() and settings.get("generate_srt", True):
+                outputs.append(str(srt_path))
+            mp3_path = directory / "outputs" / short_code / f"{source_stem}_{short_code}.mp3"
+            expected_signature = bridge._synthesis_signature(
+                translated[language], voice_reference, settings["never_cut"],
+                settings["bitrate"], settings["preserve_background"],
+            )
+            if mp3_path.exists() and lang_state.get("signature") == expected_signature:
                 lang_state["dubbing"] = "completed"
                 lang_state["mp3"] = "completed"
-                lang_state["signature"] = result["signature"]
-                lang_state["stats"] = result["stats"]
+                fractions[language] = 1.0
+                outputs.append(str(mp3_path))
+                continue
+            fractions[language] = 0.0
+            plans.append({
+                "language": language,
+                "short_code": short_code,
+                "signature": expected_signature,
+                "segments": translated[language],
+            })
+
+        def update_progress(language: str, message: str, fraction: float) -> None:
+            fractions[language] = min(1.0, max(fractions.get(language, 0.0), fraction))
+            done_units = sum(
+                len(translated[name]) * fractions.get(name, 0.0)
+                for name in settings["target_languages"]
+            )
+            self.progress.set(
+                "dubbing", message, done_units, total_segments,
+                language=language,
+            )
+
+        def accept_result(plan: dict[str, Any], result: dict[str, Any], elapsed: float) -> None:
+            language = plan["language"]
+            short_code = plan["short_code"]
+            lang_state = project["languages"].setdefault(short_code, {"name": language})
+            lang_state["dubbing"] = "completed"
+            lang_state["mp3"] = "completed"
+            lang_state["signature"] = result["signature"]
+            lang_state["stats"] = result["stats"]
+            self._record_metric(project, f"dubbing:{short_code}", elapsed, "completed")
+            outputs.append(result["mp3"])
+            update_progress(language, f"Dublagem de {language} concluída", 1.0)
+            completed_languages = sum(1 for value in fractions.values() if value >= 1.0)
+            self.progress.set(
+                "export",
+                f"{completed_languages}/{len(settings['target_languages'])} MP3 exportados",
+                completed_languages,
+                max(1, len(settings["target_languages"])),
+                language=language,
+                force=True,
+            )
+            self.store.save(project)
+
+        snapshot = ResourceMonitor(self.store.root).sample()
+        scheduler = AdaptiveScheduler(settings.get("adaptive_mode", "Automático"))
+        decision = scheduler.decision(snapshot)
+        project["runtime"] = {"resource": snapshot.as_dict(), "adaptive": decision}
+        self.store.save(project)
+        workers = min(len(plans), int(decision["tts_workers"])) if plans else 1
+        self.progress.set(
+            "dubbing",
+            f"Modo {decision['mode']}: {workers} trabalhador(es) VoxCPM",
+            sum(len(translated[name]) for name, value in fractions.items() if value >= 1.0),
+            total_segments,
+            force=True,
+        )
+
+        fallback: list[dict[str, Any]] = []
+        if workers > 1:
+            progress_dir = directory / "cache" / "worker_progress"
+            progress_dir.mkdir(parents=True, exist_ok=True)
+            tasks: list[tuple[dict[str, Any], dict[str, Any]]] = []
+            for plan in plans:
+                progress_path = progress_dir / f"{plan['short_code']}.json"
+                progress_path.unlink(missing_ok=True)
+                task = {
+                    "zast_path": str(self.zast_path),
+                    "project_dir": str(directory),
+                    "translated": plan["segments"],
+                    "target_language": plan["language"],
+                    "duration": float(source_info["duration"]),
+                    "voice_reference": voice_reference,
+                    "background_path": background_path,
+                    "never_cut": settings["never_cut"],
+                    "bitrate": settings["bitrate"],
+                    "source_stem": source_stem,
+                    "progress_path": str(progress_path),
+                    "control_path": str(directory / "cache" / "job_control.json"),
+                }
+                tasks.append((plan, task))
+
+            context = multiprocessing.get_context("spawn")
+            started_by_language = {plan["language"]: time.perf_counter() for plan, _ in tasks}
+            try:
+                with ProcessPoolExecutor(max_workers=workers, mp_context=context) as executor:
+                    future_map = {executor.submit(synthesize_task, task): (plan, task) for plan, task in tasks}
+                    pending_futures = set(future_map)
+                    while pending_futures:
+                        done, pending_futures = wait(pending_futures, timeout=1.0, return_when=FIRST_COMPLETED)
+                        for future in done:
+                            plan, _ = future_map[future]
+                            try:
+                                result = future.result()
+                            except Exception as exc:
+                                plan["parallel_error"] = str(exc)
+                                fallback.append(plan)
+                            else:
+                                elapsed = time.perf_counter() - started_by_language[plan["language"]]
+                                accept_result(plan, result, elapsed)
+                        for future in pending_futures:
+                            plan, task = future_map[future]
+                            path = Path(task["progress_path"])
+                            try:
+                                event = json.loads(path.read_text(encoding="utf-8"))
+                                fraction = event.get("progress")
+                                update_progress(
+                                    plan["language"], event.get("message", "Gerando voz"),
+                                    float(fraction) if fraction is not None else fractions[plan["language"]],
+                                )
+                            except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                                update_progress(
+                                    plan["language"],
+                                    f"Gerando {plan['language']} em {workers} fluxos",
+                                    fractions[plan["language"]],
+                                )
+            except PipelineInterrupted:
+                raise
+            except Exception:
+                finished = {name for name, value in fractions.items() if value >= 1.0}
+                fallback.extend(plan for plan in plans if plan["language"] not in finished)
+        else:
+            fallback = list(plans)
+
+        # A parallel worker may fail because its model did not fit in VRAM. Its
+        # segment cache is retained and the language is retried safely with one
+        # in-process model, reusing every completed segment.
+        unique_fallback = {plan["language"]: plan for plan in fallback if fractions[plan["language"]] < 1.0}
+        try:
+            for plan in unique_fallback.values():
+                language = plan["language"]
+                lang_state = project["languages"].setdefault(plan["short_code"], {"name": language})
+                lang_state["dubbing"] = "running"
                 self.store.save(project)
-                outputs.append(result["mp3"])
+
+                def sequential_callback(
+                    stage: str,
+                    message: str,
+                    fraction: float | None,
+                    *,
+                    current_language: str = language,
+                ) -> None:
+                    update_progress(current_language, message, float(fraction or 0.0))
+
+                started = time.perf_counter()
+                result = bridge.synthesize_language(
+                    plan["segments"], language, float(source_info["duration"]),
+                    voice_reference, background_path, settings["never_cut"],
+                    settings["bitrate"], source_stem, sequential_callback,
+                )
+                accept_result(plan, result, time.perf_counter() - started)
         finally:
             bridge.unload_tts()
+
+        self.progress.complete("dubbing", "Todas as dublagens foram concluídas")
+        self.progress.complete("export", "Todos os arquivos foram exportados")
         return sorted(set(outputs))
 
     @staticmethod

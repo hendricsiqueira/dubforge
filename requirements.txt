@@ -1,3 +1,4 @@
 # O DubForge reutiliza o ambiente virtual e as dependências do ZastTranslate.
 # Esta lista registra apenas a dependência direta da interface.
-gradio>=4.0.0
+gradio>=4.44.0,<6
+psutil>=5.9.0

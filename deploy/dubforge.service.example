@@ -1,0 +1,17 @@
+[Unit]
+Description=DubForge persistent dubbing worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=CHANGE_ME
+WorkingDirectory=/CHANGE/ME/DubForge
+EnvironmentFile=-/CHANGE/ME/DubForge/.env
+ExecStart=/CHANGE/ME/python /CHANGE/ME/DubForge/app.py
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
