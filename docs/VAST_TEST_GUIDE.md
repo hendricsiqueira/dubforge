@@ -7,6 +7,23 @@ correção, atualize este mesmo arquivo no GitHub.
 > Estado inicial: versão em teste na branch
 > `feat/adaptive-persistent-jobs`, Pull Request #3.
 
+## Máquina de teste atual — 23/11/2026
+
+```text
+GPU: NVIDIA GeForce RTX 4090
+VRAM: 49.140 MiB (~48 GB)
+Driver/KMD: 620.73.04
+CUDA reportada pelo driver: 13.5
+RAM: 117 GiB total / 105 GiB disponível
+Swap: 8 GiB
+Disco: 500 GB / 500 GB livre
+Python do template: 3.12.16
+```
+
+Situação encontrada: `/workspace/DubForge` existe, mas `ZastTranslate` e
+`dubforge-env` ainda não. O instalador abaixo usa a revisão do ZastTranslate que
+já funcionou anteriormente na Vast, em vez da versão atual do repositório.
+
 ## 1. Criar a instância
 
 Este teste parte do mesmo template/imagem em que o ZastTranslate já funcionou.
@@ -83,7 +100,7 @@ Se `ZastTranslate` ou o ambiente Python não existir, pare neste ponto e envie a
 saída dos cinco comandos. A instalação do motor depende da imagem/template usado
 e não deve ser improvisada com versões diferentes de CUDA ou PyTorch.
 
-## 4. Baixar a versão em teste
+## 4. Baixar ou atualizar a versão em teste
 
 Para uma instância nova:
 
@@ -112,7 +129,30 @@ git log -1 --oneline
 
 O primeiro comando deve mostrar `feat/adaptive-persistent-jobs`.
 
-## 5. Configurar caminhos e limites
+## 5. Instalação automática do motor na Vast
+
+Na instância atual, execute:
+
+```bash
+cd /workspace/DubForge
+git pull --ff-only origin feat/adaptive-persistent-jobs
+chmod +x scripts/install-vast.sh
+./scripts/install-vast.sh
+```
+
+O instalador:
+
+- instala FFmpeg, Git, tmux e bibliotecas do sistema;
+- baixa o ZastTranslate na revisão compatível `a567da7...`;
+- cria `/workspace/dubforge-env`;
+- instala PyTorch 2.8.0 com CUDA 12.6, WhisperX e VoxCPM 2;
+- configura o `.env`;
+- verifica GPU, imports e executa os 17 testes do DubForge.
+
+Essa etapa pode levar vários minutos e baixar muitos gigabytes. Não interrompa.
+Ao terminar, envie a parte final da saída a partir de `Torch:`.
+
+## 6. Conferir caminhos e limites
 
 Crie o `.env` a partir do modelo:
 
@@ -149,7 +189,7 @@ which python
 
 Use o resultado em `DUBFORGE_PYTHON`.
 
-## 6. Instalar apenas as dependências do DubForge
+## 7. Validação manual opcional
 
 ```bash
 cd /workspace/DubForge
@@ -168,7 +208,7 @@ Resultado esperado:
 - [ ] 17 testes concluídos com `OK`;
 - [ ] o `compileall` termina sem mensagem de erro.
 
-## 7. Iniciar de forma persistente
+## 8. Iniciar de forma persistente
 
 ```bash
 cd /workspace/DubForge
@@ -197,7 +237,7 @@ tmux attach -t dubforge
 
 Para sair sem encerrar, pressione `Ctrl+B` e depois `D`.
 
-## 8. Abrir no computador
+## 9. Abrir no computador
 
 Mantenha o PowerShell com o túnel SSH aberto e acesse:
 
@@ -215,7 +255,7 @@ Se o túnel cair, abra outro PowerShell e execute novamente o mesmo comando SSH.
 O processamento continua no servidor e a página volta a mostrar o trabalho
 persistido.
 
-## 9. Teste 1 — fumaça, um áudio curto
+## 10. Teste 1 — fumaça, um áudio curto
 
 Use primeiro um áudio de 2 a 5 minutos, não o lote completo.
 
@@ -249,7 +289,7 @@ Em outro terminal:
 watch -n 5 'df -h /workspace; du -sh /workspace/DubForge/projects 2>/dev/null'
 ```
 
-## 10. Teste 2 — persistência e controles
+## 11. Teste 2 — persistência e controles
 
 Durante uma dublagem mais longa:
 
@@ -264,7 +304,7 @@ Durante uma dublagem mais longa:
 
 Os checkpoints concluídos devem permanecer após pausa, cancelamento ou falha.
 
-## 11. Teste 3 — vários idiomas e paralelismo
+## 12. Teste 3 — vários idiomas e paralelismo
 
 Use um áudio curto e selecione Inglês, Espanhol e Italiano.
 
@@ -278,7 +318,7 @@ Use um áudio curto e selecione Inglês, Espanhol e Italiano.
 Não use **Máximo** no primeiro teste. Só experimente depois de confirmar que o
 modo Automático está estável.
 
-## 12. Teste 4 — lote real
+## 13. Teste 4 — lote real
 
 Somente depois dos testes anteriores:
 
@@ -297,7 +337,7 @@ find /workspace/DubForge/projects -type d -name audio_segments -exec du -sh {} +
 find /workspace/DubForge/projects -type d -name outputs -exec du -sh {} + 2>/dev/null | sort -h
 ```
 
-## 13. Reiniciar somente o DubForge
+## 14. Reiniciar somente o DubForge
 
 Use isto apenas quando nenhuma etapa crítica estiver no meio da gravação:
 
@@ -312,7 +352,7 @@ Ao reiniciar, trabalhos que estavam rodando devem voltar para a fila e reutiliza
 os checkpoints. Um trabalho pausado deve continuar pausado até você clicar em
 **Continuar**.
 
-## 14. Atualizar depois de uma correção
+## 15. Atualizar depois de uma correção
 
 Quando uma nova correção for publicada na mesma branch:
 
@@ -327,7 +367,7 @@ tmux kill-session -t dubforge 2>/dev/null || true
 
 Os projetos ficam em `projects/` e não são apagados pelo `git pull`.
 
-## 15. Diário de testes
+## 16. Diário de testes
 
 Preencha uma linha para cada execução:
 
