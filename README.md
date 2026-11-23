@@ -51,6 +51,8 @@ serviço do sistema:
 ```
 
 Um modelo para `systemd` está em `deploy/dubforge.service.example`.
+O roteiro completo para preparar e validar uma nova instância está em
+[`docs/VAST_TEST_GUIDE.md`](docs/VAST_TEST_GUIDE.md).
 
 ## Desempenho adaptativo
 
